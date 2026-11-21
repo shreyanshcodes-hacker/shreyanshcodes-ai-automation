@@ -1,0 +1,37 @@
+{
+  "name": "02 - Two Shorts Per Day (Shreyansh Codes)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 10,18 * * *" }]
+        }
+      },
+      "id": "cron-shorts",
+      "name": "Twice Daily 10:00 & 18:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 240]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.STUDIO_API_URL || 'http://localhost:8000'}}/api/jobs",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"topic\": \"Practical Python or AI coding tip in Hinglish\", \"format\": \"short\", \"language\": \"Hinglish\"}"
+      },
+      "id": "http-create-short-job",
+      "name": "Queue Short Production Job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 240]
+    }
+  ],
+  "connections": {
+    "Twice Daily 10:00 & 18:00": {
+      "main": [[{ "node": "Queue Short Production Job", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false
+}

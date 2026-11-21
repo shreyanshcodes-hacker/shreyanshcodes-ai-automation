@@ -1,0 +1,34 @@
+{
+  "name": "05 - Weekly Analytics Summary (Shreyansh Codes)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 20 * * 0" }]
+        }
+      },
+      "id": "cron-analytics",
+      "name": "Sunday 20:00 Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 240]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$env.STUDIO_API_URL || 'http://localhost:8000'}}/api/youtube/status"
+      },
+      "id": "http-yt-status",
+      "name": "Fetch YouTube Publish Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 240]
+    }
+  ],
+  "connections": {
+    "Sunday 20:00 Trigger": {
+      "main": [[{ "node": "Fetch YouTube Publish Status", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false
+}

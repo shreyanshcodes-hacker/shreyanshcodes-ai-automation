@@ -1,0 +1,37 @@
+{
+  "name": "03 - Two Long Videos Per Week (Shreyansh Codes)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 12 * * 2,5" }]
+        }
+      },
+      "id": "cron-long",
+      "name": "Tue & Fri 12:00 Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 240]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.STUDIO_API_URL || 'http://localhost:8000'}}/api/jobs",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"topic\": \"Deep-dive system design & AI engineering tutorial in Hinglish\", \"format\": \"long\", \"language\": \"Hinglish\", \"target_minutes\": 10}"
+      },
+      "id": "http-create-long-job",
+      "name": "Queue Long Video Job",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 240]
+    }
+  ],
+  "connections": {
+    "Tue & Fri 12:00 Trigger": {
+      "main": [[{ "node": "Queue Long Video Job", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false
+}

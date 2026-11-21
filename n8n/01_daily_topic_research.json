@@ -1,0 +1,37 @@
+{
+  "name": "01 - Daily Topic Research (Shreyansh Codes)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [{ "field": "cronExpression", "expression": "0 8 * * *" }]
+        }
+      },
+      "id": "cron-daily-research",
+      "name": "Daily 08:00 Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [220, 240]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{$env.STUDIO_API_URL || 'http://localhost:8000'}}/api/script",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"topic\": \"Top 5 practical AI developer workflows today\", \"format\": \"short\", \"language\": \"Hinglish\"}"
+      },
+      "id": "http-research",
+      "name": "Generate Topic Ideas",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 240]
+    }
+  ],
+  "connections": {
+    "Daily 08:00 Trigger": {
+      "main": [[{ "node": "Generate Topic Ideas", "type": "main", "index": 0 }]]
+    }
+  },
+  "active": false
+}
