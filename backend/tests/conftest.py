@@ -19,7 +19,9 @@ def isolated_storage(tmp_path, monkeypatch):
     monkeypatch.setenv("YOUTUBE_TOKEN_FILE", str(token_file))
 
     from app import config, youtube
+    from app.security import rate_limiter
 
+    rate_limiter.reset()
     monkeypatch.setattr(config.settings, "output_dir", str(storage_dir))
     monkeypatch.setattr(config.settings, "database_path", str(db_path))
     monkeypatch.setattr(config.settings, "youtube_token_file", str(token_file))

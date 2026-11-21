@@ -1,10 +1,11 @@
 # Security & Compliance Checklist
 
-- [ ] **Server-Side Token Storage**: YouTube OAuth tokens are stored server-side (`YOUTUBE_TOKEN_FILE`, `0600` permissions) and never exposed in API responses or logs.
-- [ ] **No Secrets in Git**: `.env`, `storage/`, and `storage/tokens/` are excluded from version control.
-- [ ] **Authorized Voice Only**: `ELEVENLABS_VOICE_CONSENT_VERIFIED=true` and `ELEVENLABS_AUTHORIZED_VOICE_IDS` allowlist enforced before TTS calls; no unauthorized voice cloning.
-- [ ] **Originality & Provenance**: Every generated asset is hashed (SHA-256) and stored with provenance metadata in `studio.db`.
-- [ ] **Synthetic Media Disclosure**: `containsSyntheticMedia=true` is set on YouTube uploads when AI voice or AI visuals are used.
-- [ ] **Private-First & QA Gate**: Videos always upload as `private` first; `publishAt` scheduling is blocked unless QA passes, source notes exist, kill switch is OFF, and `YOUTUBE_PUBLIC_SCHEDULING_ENABLED=true` is explicitly set by the owner.
-- [ ] **Kill Switch**: `POST /api/youtube/kill-switch` (`{"enabled": true}`) immediately halts all YouTube uploads.
-- [ ] **Quota-Aware Retry**: `quotaExceeded` (403) halts retries immediately to avoid API quota exhaustion.
+- [ ] **Authentication & RBAC**: All API endpoints (except `/health` and `/api/auth/register|login|logout`) require valid JWT/cookie authentication; owner/admin role required for settings, OAuth, uploads, and kill switch.
+- [ ] **CSRF & Cookies**: Cookie-authenticated state-changing requests enforce `X-CSRF-Token` matching `sc_csrf`; `HttpOnly`, `SameSite=Lax`, and `Secure` (in production) flags are set.
+- [ ] **CORS Hardening**: Explicit `FRONTEND_ORIGINS` required; wildcard `*` with credentials is forbidden and validated at startup.
+- [ ] **Path Traversal Protection**: All file paths are resolved against `OUTPUT_DIR` (`storage_root`), rejecting `..` traversal, null bytes, and outside-root paths.
+- [ ] **OAuth State Security**: `get_oauth_authorization_url()` generates a 32-byte random `state` bound to the authenticated user with a 10-minute TTL and single-use atomic consumption.
+- [ ] **Voice Authorization (Fail-Closed)**: `ELEVENLABS_VOICE_CONSENT_VERIFIED=true` and a non-empty `ELEVENLABS_AUTHORIZED_VOICE_IDS` allowlist are mandatory.
+- [ ] **Replicate SSRF/Token Protection**: Polling URLs must be `https://api.replicate.com/...` before sending `Authorization: Bearer`.
+- [ ] **Derived Synthetic Media Disclosure**: Disclosure is derived from actual generated assets & `ScenePlan`, cannot be disabled by the client, and is only marked confirmed when YouTube API confirms `status.containsSyntheticMedia=true`.
+- [ ] **Private-First & Provenance Gate**: Videos upload `private` first; `publishAt` requires QA pass, verified `ClaimProvenance` records, kill switch OFF, and `YOUTUBE_PUBLIC_SCHEDULING_ENABLED=true`.

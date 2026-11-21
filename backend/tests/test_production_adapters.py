@@ -55,15 +55,30 @@ def test_hinglish_normalization_and_chunking():
 def test_voice_authorization_and_retry(monkeypatch):
     monkeypatch.setenv("ELEVENLABS_API_KEY", "k")
     monkeypatch.setenv("ELEVENLABS_VOICE_ID", "voice_unauthorized")
+
+    # 1. Missing / false consent -> fail closed
     monkeypatch.setenv("ELEVENLABS_VOICE_CONSENT_VERIFIED", "false")
-    with pytest.raises(PermissionError):
-        production.create_voiceover("Hello Hinglish")
-
-    monkeypatch.setenv("ELEVENLABS_VOICE_CONSENT_VERIFIED", "true")
     monkeypatch.setenv("ELEVENLABS_AUTHORIZED_VOICE_IDS", "voice_ok")
-    with pytest.raises(PermissionError):
+    with pytest.raises(PermissionError, match="ELEVENLABS_VOICE_CONSENT_VERIFIED"):
         production.create_voiceover("Hello Hinglish")
 
+    # 2. Invalid consent value -> fail closed
+    monkeypatch.setenv("ELEVENLABS_VOICE_CONSENT_VERIFIED", "maybe")
+    with pytest.raises(PermissionError, match="ELEVENLABS_VOICE_CONSENT_VERIFIED"):
+        production.create_voiceover("Hello Hinglish")
+
+    # 3. Empty allowlist -> fail closed (must NEVER disable authorization)
+    monkeypatch.setenv("ELEVENLABS_VOICE_CONSENT_VERIFIED", "true")
+    monkeypatch.setenv("ELEVENLABS_AUTHORIZED_VOICE_IDS", "")
+    with pytest.raises(PermissionError, match="allowlist is empty"):
+        production.create_voiceover("Hello Hinglish")
+
+    # 4. Unauthorized voice -> rejected
+    monkeypatch.setenv("ELEVENLABS_AUTHORIZED_VOICE_IDS", "voice_ok")
+    with pytest.raises(PermissionError, match="not in ELEVENLABS_AUTHORIZED_VOICE_IDS"):
+        production.create_voiceover("Hello Hinglish")
+
+    # 5. Authorized voice + consent -> succeeds with 429 retry
     monkeypatch.setenv("ELEVENLABS_VOICE_ID", "voice_ok")
     calls = {"n": 0}
 
@@ -78,6 +93,17 @@ def test_voice_authorization_and_retry(monkeypatch):
     out = production.create_voiceover("Namaste developers!", output_name="test_vo.mp3")
     assert Path(out).is_file()
     assert calls["n"] == 2
+
+
+def test_replicate_polling_url_validation():
+    assert (
+        production.validate_replicate_poll_url("https://api.replicate.com/v1/predictions/abc")
+        == "https://api.replicate.com/v1/predictions/abc"
+    )
+    with pytest.raises(ValueError, match="HTTPS"):
+        production.validate_replicate_poll_url("http://api.replicate.com/v1/predictions/abc")
+    with pytest.raises(ValueError, match="Untrusted polling URL host"):
+        production.validate_replicate_poll_url("https://evil.example.com/steal-token")
 
 
 def test_render_slideshow_builds_ffmpeg_pipeline(tmp_path, monkeypatch):

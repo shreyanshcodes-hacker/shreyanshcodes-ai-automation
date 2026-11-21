@@ -1,6 +1,25 @@
 import React, { useEffect, useState } from "react";
 
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp("(^| )" + name + "=([^;]+)"));
+  return match ? decodeURIComponent(match[2]) : "";
+}
+
+async function apiFetch(url, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
+  const headers = { ...(options.headers || {}) };
+  if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) {
+    const csrf = getCookie("sc_csrf");
+    if (csrf) headers["X-CSRF-Token"] = csrf;
+  }
+  return fetch(url, { ...options, headers, credentials: "include" });
+}
+
 export default function App() {
+  const [user, setUser] = useState(null);
+  const [authMode, setAuthMode] = useState("login");
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
   const [jobs, setJobs] = useState([]);
   const [ytStatus, setYtStatus] = useState(null);
   const [selectedJob, setSelectedJob] = useState(null);
@@ -12,9 +31,17 @@ export default function App() {
 
   async function refresh() {
     try {
+      const meRes = await apiFetch("/api/auth/me");
+      if (!meRes.ok) {
+        setUser(null);
+        return;
+      }
+      const meData = await meRes.json();
+      setUser(meData.user);
+
       const [jobsRes, ytRes] = await Promise.all([
-        fetch("/api/jobs"),
-        fetch("/api/youtube/status")
+        apiFetch("/api/jobs"),
+        apiFetch("/api/youtube/status")
       ]);
       if (jobsRes.ok) {
         const data = await jobsRes.json();
@@ -34,13 +61,37 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
+  async function handleAuth(e) {
+    e.preventDefault();
+    setError("");
+    const endpoint = authMode === "login" ? "/api/auth/login" : "/api/auth/register";
+    const res = await apiFetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password })
+    });
+    if (!res.ok) {
+      setError(await res.text());
+      return;
+    }
+    setPassword("");
+    await refresh();
+  }
+
+  async function handleLogout() {
+    await apiFetch("/api/auth/logout", { method: "POST" });
+    setUser(null);
+    setJobs([]);
+    setYtStatus(null);
+  }
+
   async function handleCreateJob(e) {
     e.preventDefault();
     if (!topic.trim()) return;
     setSubmitting(true);
     setError("");
     try {
-      const res = await fetch("/api/jobs", {
+      const res = await apiFetch("/api/jobs", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -61,23 +112,74 @@ export default function App() {
   }
 
   async function handleCancel(id) {
-    await fetch(`/api/jobs/${id}/cancel`, { method: "POST" });
+    await apiFetch(`/api/jobs/${id}/cancel`, { method: "POST" });
     refresh();
   }
 
   async function handleRetry(id) {
-    await fetch(`/api/jobs/${id}/retry`, { method: "POST" });
+    await apiFetch(`/api/jobs/${id}/retry`, { method: "POST" });
     refresh();
   }
 
   async function toggleKillSwitch() {
     if (!ytStatus) return;
-    await fetch("/api/youtube/kill-switch", {
+    await apiFetch("/api/youtube/kill-switch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ enabled: !ytStatus.kill_switch })
     });
     refresh();
+  }
+
+  if (!user) {
+    return (
+      <div className="container" style={{ maxWidth: 460 }}>
+        <div className="card">
+          <h1 style={{ marginTop: 0 }}>Shreyansh Codes Studio</h1>
+          <p style={{ color: "var(--muted)" }}>
+            Sign in to access the AI YouTube Automation Studio.
+          </p>
+          {error && (
+            <div className="card" style={{ borderColor: "var(--danger)" }}>
+              {error}
+            </div>
+          )}
+          <form onSubmit={handleAuth} style={{ display: "grid", gap: 12 }}>
+            <div>
+              <label>Username</label>
+              <input
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                required
+              />
+            </div>
+            <div>
+              <label>Password</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                required
+              />
+            </div>
+            <button type="submit">
+              {authMode === "login" ? "Sign In" : "Create Account"}
+            </button>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() =>
+                setAuthMode(authMode === "login" ? "register" : "login")
+              }
+            >
+              {authMode === "login"
+                ? "Need an account? Register"
+                : "Already have an account? Sign In"}
+            </button>
+          </form>
+        </div>
+      </div>
+    );
   }
 
   return (
@@ -86,22 +188,29 @@ export default function App() {
         <div>
           <h1 style={{ margin: 0 }}>Shreyansh Codes AI YouTube Studio</h1>
           <p style={{ margin: "4px 0 0", color: "var(--muted)" }}>
-            Faceless Hinglish Production • 2 Shorts/day &amp; 2 Long/week • Private-First QA Gate
+            Signed in as {user.username} ({user.role}) • Private-First QA Gate
           </p>
         </div>
-        {ytStatus && (
-          <div className="actions">
-            <span className="badge">
-              YouTube: {ytStatus.connected ? "Connected" : "Not Connected"}
-            </span>
-            <button
-              className={ytStatus.kill_switch ? "danger" : "secondary"}
-              onClick={toggleKillSwitch}
-            >
-              Kill Switch: {ytStatus.kill_switch ? "ON" : "OFF"}
-            </button>
-          </div>
-        )}
+        <div className="actions">
+          {ytStatus && (
+            <>
+              <span className="badge">
+                YouTube: {ytStatus.connected ? "Connected" : "Not Connected"}
+              </span>
+              {(user.role === "owner" || user.role === "admin") && (
+                <button
+                  className={ytStatus.kill_switch ? "danger" : "secondary"}
+                  onClick={toggleKillSwitch}
+                >
+                  Kill Switch: {ytStatus.kill_switch ? "ON" : "OFF"}
+                </button>
+              )}
+            </>
+          )}
+          <button className="secondary" onClick={handleLogout}>
+            Sign Out
+          </button>
+        </div>
       </div>
 
       {error && (
