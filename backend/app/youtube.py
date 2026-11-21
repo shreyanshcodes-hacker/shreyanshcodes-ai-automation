@@ -1,8 +1,9 @@
-"""YouTube OAuth 2.0, resumable private-first upload, scheduling, idempotency, and kill switch."""
+"""YouTube OAuth 2.0 (CSRF/state-bound), resumable private-first upload, derived disclosure, and kill switch."""
 from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 import urllib.parse
 from pathlib import Path
@@ -59,11 +60,23 @@ def load_tokens() -> dict[str, Any] | None:
     return json.loads(p.read_text(encoding="utf-8"))
 
 
-def get_oauth_authorization_url(state: str = "studio") -> str:
+def _validated_redirect_uri() -> str:
+    redirect_uri = os.getenv("YOUTUBE_REDIRECT_URI", settings.youtube_redirect_uri).strip()
+    parsed = urllib.parse.urlparse(redirect_uri)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise RuntimeError("YOUTUBE_REDIRECT_URI is invalid.")
+    if settings.app_env == "production" and parsed.scheme != "https":
+        raise RuntimeError("YOUTUBE_REDIRECT_URI must use HTTPS in production.")
+    return redirect_uri
+
+
+def get_oauth_authorization_url(user_id: str) -> str:
     client_id = os.getenv("YOUTUBE_CLIENT_ID", settings.youtube_client_id)
-    redirect_uri = os.getenv("YOUTUBE_REDIRECT_URI", settings.youtube_redirect_uri)
     if not client_id:
         raise RuntimeError("Configure YOUTUBE_CLIENT_ID in .env")
+    redirect_uri = _validated_redirect_uri()
+    state = secrets.token_urlsafe(32)
+    db.create_oauth_state(state=state, user_id=user_id, ttl_seconds=600)
     params = {
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -76,12 +89,14 @@ def get_oauth_authorization_url(state: str = "studio") -> str:
     return f"{GOOGLE_AUTH_URL}?{urllib.parse.urlencode(params)}"
 
 
-def exchange_oauth_code(code: str) -> dict[str, Any]:
+def exchange_oauth_code(code: str, state: str, user_id: str) -> dict[str, Any]:
+    if not state or not db.consume_oauth_state(state=state, user_id=user_id):
+        raise PermissionError("Invalid, expired, reused, or mismatched OAuth state.")
     client_id = os.getenv("YOUTUBE_CLIENT_ID", settings.youtube_client_id)
     client_secret = os.getenv("YOUTUBE_CLIENT_SECRET", settings.youtube_client_secret)
-    redirect_uri = os.getenv("YOUTUBE_REDIRECT_URI", settings.youtube_redirect_uri)
     if not client_id or not client_secret:
         raise RuntimeError("Configure YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET in .env")
+    redirect_uri = _validated_redirect_uri()
 
     resp = requests.post(
         GOOGLE_TOKEN_URL,
@@ -140,6 +155,33 @@ def _is_public_scheduling_enabled() -> bool:
         str(settings.youtube_public_scheduling_enabled),
     ).lower()
     return val in ("1", "true", "yes")
+
+
+def derive_job_disclosure(job: dict[str, Any]) -> dict[str, Any]:
+    """Derive synthetic media disclosure strictly from backend assets & ScenePlan (no client override)."""
+    result = job.get("result") or {}
+    if isinstance(job.get("disclosure"), dict):
+        return job["disclosure"]
+    if isinstance(result.get("disclosure"), dict):
+        return result["disclosure"]
+
+    assets = db.list_assets(job_id=job["id"])
+    scene_plan = result.get("scene_plan") or {}
+    has_ai_visuals = any(
+        a.get("asset_type") == "image" and a.get("provenance", {}).get("synthetic", True)
+        for a in assets
+    )
+    has_ai_voice = any(
+        a.get("asset_type") == "audio" and a.get("provenance", {}).get("synthetic", True)
+        for a in assets
+    )
+    has_other = bool(scene_plan.get("synthetic_disclosure", True))
+    return {
+        "has_ai_visuals": has_ai_visuals,
+        "has_ai_voice": has_ai_voice,
+        "has_other_synthetic": has_other,
+        "requires_disclosure": bool(has_ai_visuals or has_ai_voice or has_other),
+    }
 
 
 def _resumable_upload(
@@ -202,9 +244,9 @@ def upload_job_video(
     tags: list[str] | None = None,
     publish_at: str | None = None,
     idempotency_key: str | None = None,
-    contains_synthetic_media: bool = True,
+    owner_user_id: str | None = None,
 ) -> dict[str, Any]:
-    """Private-first YouTube resumable upload with strict QA, provenance, and kill-switch gates."""
+    """Private-first YouTube resumable upload with derived synthetic disclosure and strict QA/provenance gates."""
     if is_kill_switch_enabled():
         raise PermissionError("YouTube publishing blocked: kill switch is enabled.")
 
@@ -224,12 +266,15 @@ def upload_job_video(
 
     qa_report = result.get("qa_report") or {}
     qa_passed = bool(qa_report.get("passed"))
+    public_allowed = bool(qa_report.get("public_schedule_allowed", qa_passed))
     has_sources = bool(qa_report.get("checks", {}).get("factual_sources_present"))
 
-    # Safety & Policy Gate (Milestone 11):
-    # Private-first always; only schedule publishAt if QA passed, sources present, and owner enabled public scheduling.
+    disclosure = derive_job_disclosure(job)
+    requires_disclosure = bool(disclosure.get("requires_disclosure", True))
+
     can_schedule_public = (
         qa_passed
+        and public_allowed
         and has_sources
         and _is_public_scheduling_enabled()
         and bool(publish_at)
@@ -242,12 +287,12 @@ def upload_job_video(
             "title": title[:100],
             "description": description[:5000],
             "tags": tags or [],
-            "categoryId": "28",  # Science & Technology
+            "categoryId": "28",
         },
         "status": {
             "privacyStatus": privacy_status,
             "selfDeclaredMadeForKids": False,
-            "containsSyntheticMedia": bool(contains_synthetic_media),
+            "containsSyntheticMedia": requires_disclosure,
         },
     }
     if effective_publish_at:
@@ -260,23 +305,34 @@ def upload_job_video(
         metadata=metadata,
     )
     yt_video_id = yt_resp.get("id")
+    api_status = yt_resp.get("status") if isinstance(yt_resp.get("status"), dict) else {}
+    disclosure_confirmed = api_status.get("containsSyntheticMedia") is True
+    disclosure_warning = (
+        None
+        if (not requires_disclosure or disclosure_confirmed)
+        else "Synthetic media disclosure was submitted, but YouTube API response did not confirm containsSyntheticMedia=true."
+    )
     record = db.upsert_publish_record(
         job_id=job_id,
+        owner_user_id=owner_user_id or job.get("owner_user_id"),
         idempotency_key=idem_key,
         youtube_video_id=yt_video_id,
         privacy_status=privacy_status,
         publish_at=effective_publish_at,
         qa_passed=qa_passed,
         qa_report=qa_report,
-        synthetic_disclosed=contains_synthetic_media,
+        synthetic_disclosed=disclosure_confirmed,
+        disclosure=disclosure,
         status="uploaded",
     )
     return {
         **record,
+        "synthetic_disclosure_confirmed": disclosure_confirmed,
+        "disclosure_warning": disclosure_warning,
         "idempotent_replay": False,
         "kept_private_reason": (
             None
             if effective_publish_at
-            else "Private-first safety gate active (QA/source verification or owner public-scheduling flag)."
+            else "Private-first safety gate active (QA/factual provenance or owner public-scheduling flag)."
         ),
     }

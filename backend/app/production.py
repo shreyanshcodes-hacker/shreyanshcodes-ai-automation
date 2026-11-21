@@ -7,14 +7,21 @@ import re
 import shutil
 import struct
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
 from .config import settings
+
+_ELEVENLABS_SEM = threading.BoundedSemaphore(max(1, settings.elevenlabs_max_concurrency))
+_REPLICATE_SEM = threading.BoundedSemaphore(max(1, settings.replicate_max_concurrency))
+_TRUSTED_REPLICATE_POLL_HOSTS = frozenset({"api.replicate.com"})
+_TRUSTED_REPLICATE_OUTPUT_HOSTS = frozenset({"replicate.delivery", "pbxt.replicate.delivery"})
 
 
 def _storage_dirs() -> tuple[Path, Path]:
@@ -65,20 +72,27 @@ def normalize_hinglish_for_tts(text: str) -> tuple[str, list[str]]:
 
 
 def verify_voice_authorized(voice_id: str) -> None:
-    """Ensure voice selection is explicitly authorized and consent-verified."""
-    consent_env = os.getenv(
-        "ELEVENLABS_VOICE_CONSENT_VERIFIED",
-        str(settings.elevenlabs_voice_consent_verified),
-    ).lower()
-    if consent_env not in ("1", "true", "yes"):
+    """Fail-closed check: consent must be verified and voice_id must match a non-empty allowlist."""
+    if not voice_id or not voice_id.strip():
+        raise PermissionError("Voice ID is required.")
+    consent_raw = os.getenv("ELEVENLABS_VOICE_CONSENT_VERIFIED")
+    if consent_raw is None:
+        consent_raw = str(settings.elevenlabs_voice_consent_verified)
+    consent_norm = consent_raw.strip().lower()
+    if consent_norm not in ("1", "true", "yes"):
         raise PermissionError(
-            "Voice generation blocked: set ELEVENLABS_VOICE_CONSENT_VERIFIED=true to confirm authorized voice rights."
+            "Voice generation blocked: ELEVENLABS_VOICE_CONSENT_VERIFIED must be explicitly 'true'."
         )
-    auth_raw = os.getenv(
-        "ELEVENLABS_AUTHORIZED_VOICE_IDS", settings.elevenlabs_authorized_voice_ids
-    )
+
+    auth_raw = os.getenv("ELEVENLABS_AUTHORIZED_VOICE_IDS")
+    if auth_raw is None:
+        auth_raw = settings.elevenlabs_authorized_voice_ids
     allowed = {v.strip() for v in auth_raw.split(",") if v.strip()}
-    if allowed and voice_id not in allowed:
+    if not allowed:
+        raise PermissionError(
+            "Voice generation blocked: ELEVENLABS_AUTHORIZED_VOICE_IDS allowlist is empty."
+        )
+    if voice_id.strip() not in allowed:
         raise PermissionError(
             f"Voice ID '{voice_id}' is not in ELEVENLABS_AUTHORIZED_VOICE_IDS."
         )
@@ -202,27 +216,28 @@ def create_voiceover(
 
     chunk_files: list[Path] = []
     try:
-        for idx, chunk in enumerate(chunks):
-            r = _request_with_backoff(
-                "POST",
-                url,
-                headers={
-                    "xi-api-key": key,
-                    "Content-Type": "application/json",
-                    "Accept": "audio/mpeg",
-                },
-                json={
-                    "text": chunk,
-                    "model_id": model_id,
-                    "voice_settings": {"stability": 0.48, "similarity_boost": 0.78},
-                },
-                timeout=180,
-            )
-            if not r.content or len(r.content) < 100:
-                raise RuntimeError(f"ElevenLabs returned empty/invalid audio for chunk {idx + 1}")
-            part = assets / f"tts_chunk_{uuid.uuid4().hex}.mp3"
-            part.write_bytes(r.content)
-            chunk_files.append(part)
+        with _ELEVENLABS_SEM:
+            for idx, chunk in enumerate(chunks):
+                r = _request_with_backoff(
+                    "POST",
+                    url,
+                    headers={
+                        "xi-api-key": key,
+                        "Content-Type": "application/json",
+                        "Accept": "audio/mpeg",
+                    },
+                    json={
+                        "text": chunk,
+                        "model_id": model_id,
+                        "voice_settings": {"stability": 0.48, "similarity_boost": 0.78},
+                    },
+                    timeout=180,
+                )
+                if not r.content or len(r.content) < 100:
+                    raise RuntimeError(f"ElevenLabs returned empty/invalid audio for chunk {idx + 1}")
+                part = assets / f"tts_chunk_{uuid.uuid4().hex}.mp3"
+                part.write_bytes(r.content)
+                chunk_files.append(part)
 
         target = assets / Path(output_name).name
         _concatenate_audio_files(chunk_files, target)
@@ -359,12 +374,38 @@ def _parse_webp_dimensions(data: bytes) -> tuple[int, int]:
     return 0, 0
 
 
+def validate_replicate_poll_url(url: str) -> str:
+    """Validate that a Replicate polling URL uses HTTPS and points to a trusted Replicate API host."""
+    if not url or not isinstance(url, str):
+        raise ValueError("Polling URL is missing or invalid.")
+    parsed = urlparse(url.strip())
+    if parsed.scheme.lower() != "https":
+        raise ValueError(f"Untrusted polling URL scheme '{parsed.scheme}'; HTTPS is required.")
+    host = (parsed.hostname or "").lower()
+    if host not in _TRUSTED_REPLICATE_POLL_HOSTS:
+        raise ValueError(f"Untrusted polling URL host '{host}'; refusing to send bearer token.")
+    return url.strip()
+
+
+def validate_replicate_output_url(url: str) -> str:
+    """Validate that a Replicate output download URL uses HTTPS and a trusted Replicate host."""
+    if not url or not isinstance(url, str):
+        raise ValueError("Output URL is missing or invalid.")
+    parsed = urlparse(url.strip())
+    if parsed.scheme.lower() != "https":
+        raise ValueError(f"Untrusted output URL scheme '{parsed.scheme}'; HTTPS is required.")
+    host = (parsed.hostname or "").lower()
+    if host not in _TRUSTED_REPLICATE_OUTPUT_HOSTS and not host.endswith(".replicate.delivery"):
+        raise ValueError(f"Untrusted Replicate output URL host '{host}'.")
+    return url.strip()
+
+
 def generate_image(
     prompt: str,
     output_name: str = "scene.png",
     fmt: str = "short",
 ) -> str:
-    """Replicate adapter with schema adaptation and MIME/dimension validation."""
+    """Replicate adapter with schema adaptation, SSRF/polling URL validation, and MIME/dimension checks."""
     assets, _ = _storage_dirs()
     token = os.getenv("REPLICATE_API_TOKEN", settings.replicate_api_token)
     version = os.getenv("REPLICATE_MODEL_VERSION", settings.replicate_model_version)
@@ -374,35 +415,33 @@ def generate_image(
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     input_payload = build_replicate_input(prompt, fmt=fmt, version=version, preset=preset)
-    r = _request_with_backoff(
-        "POST",
-        "https://api.replicate.com/v1/predictions",
-        headers=headers,
-        json={"version": version, "input": input_payload},
-        timeout=60,
-    )
-    prediction = r.json()
-    poll = prediction.get("urls", {}).get("get")
-    if not poll:
-        raise RuntimeError(f"Image provider response missing poll URL: {prediction}")
+    with _REPLICATE_SEM:
+        r = _request_with_backoff(
+            "POST",
+            "https://api.replicate.com/v1/predictions",
+            headers=headers,
+            json={"version": version, "input": input_payload},
+            timeout=60,
+        )
+        prediction = r.json()
+        poll = validate_replicate_poll_url(prediction.get("urls", {}).get("get", ""))
 
-    for _ in range(90):
-        state = _request_with_backoff(
-            "GET", poll, headers={"Authorization": f"Bearer {token}"}, timeout=30
-        ).json()
-        if state.get("status") == "succeeded":
-            out = state.get("output")
-            url = out[0] if isinstance(out, list) else out
-            if not url:
-                raise RuntimeError("Image provider returned empty output")
-            img = _request_with_backoff("GET", url, timeout=90)
-            inspect_image_bytes(img.content, img.headers.get("Content-Type"))
-            target = assets / Path(output_name).name
-            target.write_bytes(img.content)
-            return str(target)
-        if state.get("status") in ("failed", "canceled"):
-            raise RuntimeError(str(state.get("error")))
-        time.sleep(4)
+        for _ in range(90):
+            state = _request_with_backoff(
+                "GET", poll, headers={"Authorization": f"Bearer {token}"}, timeout=30
+            ).json()
+            if state.get("status") == "succeeded":
+                out = state.get("output")
+                raw_url = out[0] if isinstance(out, list) else out
+                safe_url = validate_replicate_output_url(raw_url)
+                img = _request_with_backoff("GET", safe_url, timeout=90)
+                inspect_image_bytes(img.content, img.headers.get("Content-Type"))
+                target = assets / Path(output_name).name
+                target.write_bytes(img.content)
+                return str(target)
+            if state.get("status") in ("failed", "canceled"):
+                raise RuntimeError(str(state.get("error")))
+            time.sleep(4)
     raise TimeoutError("Image generation timed out")
 
 
@@ -620,4 +659,5 @@ def render_slideshow(
         "has_audio": audio,
         "qa_passed": passed,
         "scene_durations": durations,
+        "renderer_mode": "still_image_slideshow",
     }

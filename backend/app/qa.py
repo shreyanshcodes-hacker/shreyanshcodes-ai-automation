@@ -1,4 +1,4 @@
-"""Comprehensive video, audio, subtitle, duplicate-hash, and provenance QA checks (Milestone 8)."""
+"""Comprehensive video, audio, subtitle, duplicate-hash, and structured provenance QA checks."""
 from __future__ import annotations
 
 import json
@@ -7,9 +7,10 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from . import db
-from .schemas import QACheckResult, ScenePlan
+from .schemas import ClaimProvenance, QACheckResult, ScenePlan
 
 
 def _bin(name: str) -> str:
@@ -32,8 +33,7 @@ def check_subtitle_safe_margins(srt_path: Path, fmt: str = "short") -> tuple[boo
     for block in re.split(r"\n\s*\n", text):
         lines = block.splitlines()
         if len(lines) >= 3:
-            caption_lines = lines[2:]
-            for line in caption_lines:
+            for line in lines[2:]:
                 if len(line.strip()) > max_line_chars:
                     too_long.append(line.strip()[:50])
 
@@ -88,13 +88,86 @@ def _detect_audio_loudness_and_clipping(
     max_vol = float(max_match.group(1)) if max_match else None
     mean_vol = float(mean_match.group(1)) if mean_match else None
 
-    # Clipping if max_volume >= 0.0 dB; too quiet if mean_volume < -35 dB
     ok = True
     if max_vol is not None and max_vol >= 0.0:
         ok = False
     if mean_vol is not None and mean_vol < -35.0:
         ok = False
     return ok, {"max_volume_db": max_vol, "mean_volume_db": mean_vol}
+
+
+def evaluate_provenance_records(
+    records: list[ClaimProvenance],
+    scene_plan: ScenePlan | None = None,
+) -> tuple[bool, bool, dict[str, Any], list[str], list[str]]:
+    """
+    Evaluate structured factual provenance records.
+    Returns (records_valid, all_verified, summary_dict, blocking_reasons, warnings).
+    """
+    blocking: list[str] = []
+    warnings: list[str] = []
+    verified: list[str] = []
+    pending: list[str] = []
+    unsupported: list[str] = []
+    contradictory: list[str] = []
+    malformed: list[str] = []
+
+    for rec in records:
+        parsed = urlparse(rec.source_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            malformed.append(rec.claim_text[:60])
+        if not rec.supporting_excerpt.strip() or not rec.source_title.strip():
+            malformed.append(rec.claim_text[:60])
+
+        if rec.verification_status == "verified":
+            verified.append(rec.claim_text[:80])
+        elif rec.verification_status == "pending_review":
+            pending.append(rec.claim_text[:80])
+        elif rec.verification_status == "unsupported":
+            unsupported.append(rec.claim_text[:80])
+        elif rec.verification_status == "contradictory":
+            contradictory.append(rec.claim_text[:80])
+
+    if malformed:
+        blocking.append(f"Malformed provenance records: {malformed}")
+    if unsupported:
+        blocking.append(f"Unsupported factual claims: {unsupported}")
+    if contradictory:
+        blocking.append(f"Contradictory factual claims: {contradictory}")
+    if pending:
+        warnings.append(f"Claims awaiting human verification (public scheduling blocked): {pending}")
+
+    if scene_plan and scene_plan.facts_to_verify:
+        warnings.append(
+            f"ScenePlan lists facts_to_verify awaiting human review: {scene_plan.facts_to_verify}"
+        )
+
+    needs_verif_scenes = (
+        [s.scene_index for s in scene_plan.scenes if s.needs_verification]
+        if scene_plan
+        else []
+    )
+    if needs_verif_scenes and not records:
+        warnings.append(
+            f"Scenes {needs_verif_scenes} marked needs_verification=true without structured provenance records."
+        )
+
+    records_valid = len(malformed) == 0 and len(unsupported) == 0 and len(contradictory) == 0
+    all_verified = (
+        records_valid
+        and len(pending) == 0
+        and not (scene_plan and scene_plan.facts_to_verify)
+        and not (needs_verif_scenes and not records)
+    )
+    summary = {
+        "verified_count": len(verified),
+        "pending_review_count": len(pending),
+        "unsupported_count": len(unsupported),
+        "contradictory_count": len(contradictory),
+        "malformed_count": len(malformed),
+        "records": [r.model_dump() for r in records],
+    }
+    return records_valid, all_verified, summary, blocking, warnings
 
 
 def run_qa_checks(
@@ -104,24 +177,27 @@ def run_qa_checks(
     scene_plan: ScenePlan | None = None,
     subtitle_path: str | Path | None = None,
     asset_ids: list[str] | None = None,
+    provenance_records: list[ClaimProvenance] | None = None,
     check_duplicate_hash: bool = True,
 ) -> QACheckResult:
-    """Run all technical, safety, factual-source, and provenance QA checks."""
+    """Run technical, safety, factual provenance, and asset provenance QA checks."""
     vpath = Path(video_path).resolve()
     checks: dict[str, bool] = {}
     details: dict[str, Any] = {}
     blocking: list[str] = []
+    warnings: list[str] = []
 
     if not vpath.is_file() or vpath.stat().st_size == 0:
         return QACheckResult(
             passed=False,
+            public_schedule_allowed=False,
+            private_preview_allowed=False,
             checks={"file_exists": False},
             details={"video_path": str(vpath)},
             blocking_reasons=["Rendered video file is missing or empty."],
         )
     checks["file_exists"] = True
 
-    # FFprobe metadata
     ffprobe = _bin("ffprobe")
     ffmpeg = _bin("ffmpeg")
     raw = subprocess.run(
@@ -166,7 +242,6 @@ def run_qa_checks(
     if not checks["audio_stream"]:
         blocking.append("Missing audio stream in rendered video.")
 
-    # Black frames & loudness/clipping
     black_ok, black_info = _detect_black_frames(ffmpeg, vpath)
     checks["no_black_frames"] = black_ok
     details["black_frames"] = black_info
@@ -179,7 +254,6 @@ def run_qa_checks(
     if not loud_ok:
         blocking.append(f"Audio loudness/clipping check failed: {loud_info}")
 
-    # Subtitle safe margins
     if subtitle_path:
         sub_ok, sub_info = check_subtitle_safe_margins(Path(subtitle_path), fmt=fmt)
         checks["subtitle_safe_margins"] = sub_ok
@@ -187,7 +261,6 @@ def run_qa_checks(
         if not sub_ok:
             blocking.append(f"Subtitle safe-margin check failed: {sub_info}")
 
-    # Duplicate file hash check
     video_hash = db.sha256_file(vpath)
     details["video_sha256"] = video_hash
     if check_duplicate_hash:
@@ -199,28 +272,35 @@ def run_qa_checks(
     else:
         checks["not_duplicate_hash"] = True
 
-    # Factual-source & provenance checks
+    records = provenance_records if provenance_records is not None else (
+        scene_plan.provenance_records if scene_plan else []
+    )
+    records_valid, all_verified, prov_summary, prov_blocking, prov_warnings = evaluate_provenance_records(
+        records, scene_plan=scene_plan
+    )
+    blocking.extend(prov_blocking)
+    warnings.extend(prov_warnings)
+
     if scene_plan is not None:
         missing_sources = [
             s.scene_index for s in scene_plan.scenes if not (s.source_notes or "").strip()
         ]
-        unverified_facts = list(scene_plan.facts_to_verify)
-        checks["factual_sources_present"] = len(missing_sources) == 0
-        checks["no_pending_fact_verification"] = len(unverified_facts) == 0
+        checks["factual_sources_present"] = len(missing_sources) == 0 and records_valid
+        checks["factual_claims_verified"] = all_verified
         checks["synthetic_disclosure_set"] = bool(scene_plan.synthetic_disclosure)
         details["provenance"] = {
             "missing_source_scenes": missing_sources,
-            "facts_to_verify": unverified_facts,
+            "facts_to_verify": list(scene_plan.facts_to_verify),
             "synthetic_disclosure": scene_plan.synthetic_disclosure,
+            "structured_claims": prov_summary,
         }
         if missing_sources:
             blocking.append(f"Missing source_notes on scenes: {missing_sources}")
-        if unverified_facts:
-            blocking.append(f"Unverified facts must be reviewed before public publish: {unverified_facts}")
         if not scene_plan.synthetic_disclosure:
             blocking.append("Synthetic media disclosure flag must be true for AI voice/visuals.")
     else:
         checks["factual_sources_present"] = False
+        checks["factual_claims_verified"] = False
         blocking.append("Missing ScenePlan provenance/source evidence.")
 
     if asset_ids is not None:
@@ -228,10 +308,18 @@ def run_qa_checks(
         if not asset_ids:
             blocking.append("No registered asset provenance records provided.")
 
-    passed = all(checks.values())
+    technical_checks = {
+        k: v for k, v in checks.items() if k != "factual_claims_verified"
+    }
+    private_preview_allowed = all(technical_checks.values())
+    public_schedule_allowed = all(checks.values())
+
     return QACheckResult(
-        passed=passed,
+        passed=public_schedule_allowed,
+        public_schedule_allowed=public_schedule_allowed,
+        private_preview_allowed=private_preview_allowed,
         checks=checks,
         details=details,
         blocking_reasons=blocking,
+        warnings=warnings,
     )

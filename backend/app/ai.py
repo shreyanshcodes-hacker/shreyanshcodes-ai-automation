@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from google import genai
 from google.genai import types
 
 from .config import settings
 from .schemas import ScenePlan
+
+_GEMINI_SEM = threading.BoundedSemaphore(max(1, settings.gemini_max_concurrency))
 
 
 def _client() -> genai.Client:
@@ -17,10 +20,11 @@ def _client() -> genai.Client:
 
 
 def generate_text(prompt: str) -> str:
-    response = _client().models.generate_content(
-        model=settings.gemini_model,
-        contents=prompt,
-    )
+    with _GEMINI_SEM:
+        response = _client().models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+        )
     return response.text or ""
 
 
@@ -69,16 +73,17 @@ Rules:
 3. Set synthetic_disclosure=true because AI voice and AI visuals are used.
 4. Populate facts_to_verify with any specific claims that must be checked before publishing."""
 
-    client = _client()
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=ScenePlan,
-    )
-    response = client.models.generate_content(
-        model=settings.gemini_model,
-        contents=prompt,
-        config=config,
-    )
+    with _GEMINI_SEM:
+        client = _client()
+        config = types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ScenePlan,
+        )
+        response = client.models.generate_content(
+            model=settings.gemini_model,
+            contents=prompt,
+            config=config,
+        )
 
     if getattr(response, "parsed", None) is not None:
         parsed = response.parsed
